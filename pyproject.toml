@@ -12,7 +12,7 @@ dependencies = [
     "requests",
     "vecto-sdk",
     "numpy",
-    "openai==1.52.0"
+    "openai==1.57"
 ]
 
 # Xircuits-specific configurations
