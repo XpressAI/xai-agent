@@ -1,4 +1,4 @@
 numpy==1.26.4
-openai
+openai==1.84.0
 vecto-sdk==0.2.3
 requests==2.31.0
