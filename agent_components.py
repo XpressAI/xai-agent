@@ -33,6 +33,123 @@ except Exception as e:
 def random_string(length):
     return ''.join(random.choice(string.ascii_letters) for _ in range(length))
 
+def is_openai_model(model_name: str) -> bool:
+    """Check if the model is an OpenAI model that supports system messages."""
+    if not model_name:
+        return False
+    return model_name.startswith(('o1', 'o3', 'o4', 'gpt'))
+
+def convert_old_tool_syntax_to_xml(text: str) -> str:
+    """Convert old TOOL: syntax to new XML format in tool descriptions."""
+    import re
+    
+    # Pattern to match old style: TOOL: tool_name args (args optional)
+    # This pattern captures tool name and optional arguments
+    old_tool_pattern = r'^(\s*)TOOL:\s+(\w+)(?:\s+(.*))?$'
+    
+    lines = text.split('\n')
+    converted_lines = []
+    
+    for line in lines:
+        match = re.match(old_tool_pattern, line)
+        if match:
+            indent = match.group(1)
+            tool_name = match.group(2)
+            args = match.group(3) if match.group(3) else ''
+            
+            # Convert to XML format
+            if args:
+                # If args exist, put them on a new line for better readability
+                converted_lines.append(f'{indent}<tool name="{tool_name}">')
+                converted_lines.append(f'{indent}{args}')
+                converted_lines.append(f'{indent}</tool>')
+            else:
+                # No args, single line format
+                converted_lines.append(f'{indent}<tool name="{tool_name}"></tool>')
+        else:
+            converted_lines.append(line)
+    
+    return '\n'.join(converted_lines)
+
+def parse_xml_args_to_dict(xml_content: str) -> dict:
+    """Parse XML-style arguments into a dictionary using a simple SAX-like approach.
+    
+    Supports format like:
+    <arg1>value1</arg1>
+    <arg2>value2</arg2>
+    
+    Returns None if the content is not valid XML args.
+    """
+    import re
+    
+    # Strip leading/trailing whitespace
+    xml_content = xml_content.strip()
+    
+    # If empty, return None
+    if not xml_content:
+        return None
+    
+    # Simple pattern to match XML tags with content
+    # This matches: <tag>content</tag>
+    tag_pattern = r'<(\w+)>(.*?)</\1>'
+    
+    matches = re.findall(tag_pattern, xml_content, re.DOTALL)
+    
+    # If no matches found, it's not XML format
+    if not matches:
+        return None
+    
+    # Build dictionary from matches
+    result = {}
+    for tag_name, content in matches:
+        result[tag_name] = content.strip()
+    
+    # Check if there's any content that's not within tags
+    # Remove all matched tags and see if there's leftover content
+    remaining = xml_content
+    for match in re.finditer(tag_pattern, xml_content, re.DOTALL):
+        remaining = remaining.replace(match.group(0), '', 1)
+    
+    # If there's significant non-whitespace content remaining, it's not pure XML
+    if remaining.strip():
+        return None
+    
+    return result
+
+def parse_tool_args(args_str: str) -> tuple:
+    """Parse tool arguments and return (parsed_dict, raw_string).
+    
+    Supports:
+    1. JSON format: {"arg1": "value1", "arg2": "value2"}
+    2. XML format: <arg1>value1</arg1><arg2>value2</arg2>
+    3. Empty args: returns (None, "")
+    4. Plain text: returns (None, raw_text)
+    
+    Returns:
+        tuple: (parsed_dict or None, raw_string)
+    """
+    args_str = args_str.strip()
+    
+    # Handle empty args
+    if not args_str:
+        return (None, "")
+    
+    # Try JSON first
+    try:
+        parsed = json.loads(args_str)
+        if isinstance(parsed, dict):
+            return (parsed, args_str)
+    except:
+        pass
+    
+    # Try XML format
+    xml_dict = parse_xml_args_to_dict(args_str)
+    if xml_dict is not None:
+        return (xml_dict, args_str)
+    
+    # Neither JSON nor XML, return raw content
+    return (None, args_str)
+
 def encode_prompt(model_id: str, conversation: list):
     ret_messages = []
 
@@ -192,7 +309,7 @@ class MutableVariable:
 
 
 @xai_component(type="Start", color="red")
-class AgentDefineTool(Component):    
+class AgentDefineTool(Component):
     """Define a tool that the agent can use when it deems necessary.
 
     This event will be called when the Agent uses this tool.  Perform the tool
@@ -205,6 +322,7 @@ class AgentDefineTool(Component):
 
     ##### outPorts:
     - tool_input: The input for the tool coming from the agent.
+    - tool_args: The parsed JSON arguments if the input is valid JSON, otherwise None.
 
     """
 
@@ -213,6 +331,7 @@ class AgentDefineTool(Component):
     for_toolbelt: InArg[str]
     
     tool_input: OutArg[str]
+    tool_args: OutArg[dict]
 
     
     def init(self, ctx):
@@ -232,6 +351,9 @@ class AgentDefineTool(Component):
             
             def __call__(self, prompt):
                 other_self.tool_input.value = prompt
+                # Parse arguments using the new flexible parser
+                parsed_args, _ = parse_tool_args(prompt)
+                other_self.tool_args.value = parsed_args
                 SubGraphExecutor(other_self.next).do(ctx)
                 result = ctx['tool_output']
                 ctx['tool_output'] = None
@@ -638,6 +760,8 @@ def make_tools_prompt(standard_toolbelt: dict, enabled_mcp_servers: list, metada
     for key, value in standard_toolbelt.items():
         # Ensure value has a description attribute
         desc = getattr(value, 'description', 'No description available.')
+        # Convert any old TOOL: syntax to new XML format
+        desc = convert_old_tool_syntax_to_xml(desc)
         tool_desc_parts.append(f'{key}: {desc}')
 
     # 2. Add MCP tools
@@ -646,23 +770,24 @@ def make_tools_prompt(standard_toolbelt: dict, enabled_mcp_servers: list, metada
             mcp_tools = query_core_system_for_mcp_tools(server_name)
             for tool_info in mcp_tools:
                  # Optionally prefix with server name for clarity if needed: f'{server_name}.{tool_info["name"]}'
-                tool_desc_parts.append(f'{tool_info["name"]}: {tool_info["description"]}')
+                desc = convert_old_tool_syntax_to_xml(tool_info["description"])
+                tool_desc_parts.append(f'{tool_info["name"]}: {desc}')
         except Exception as e:
             print(f"Error querying MCP tools for server '{server_name}': {e}")
             tool_desc_parts.append(f"# Error loading tools for MCP server: {server_name}")
 
     tools_string = '\n'.join(tool_desc_parts)
 
-    # Memory tool descriptions (unchanged)
-    recall = 'lookup_memory: Fuzzily looks up a previously remembered JSON memo in your memory.\nEXAMPLE:\n\nUSER:\nWhat things did I have to do today?\nASSISTANT:\nTOOL: lookup_memory {"query":"todo list"}\nSYSTEM:\n[{"id": 1, "summary": Todo List for Februrary", "tasks": [{"title": "Send invoices", "due_date":"2025-02-01"}]}]\nASSISTANT:\nTOOL: get_current_time\nSYSTEM:\n2024-02-01T09:30:03\nASSISTANT:\nLooks like you just had to send invoices today.\n'
-    remember = 'create_memory: Remembers a new json note for the future.  Always provide json with a summary prompt that will serve as the lookup vector.  The summary and entire json can be remembered later with lookup_memory.\nEXAMPLE:\n\nUSER:\nRemind me to send invoices on the first of Feburary.\nASSISTANT:\nTOOL: create_memory { "summary": "todo List for Februrary", "tasks": [{"title": "Send invoices", "due_date":"2025-02-01"}]}"\n'
+    # Memory tool descriptions with both JSON and XML examples
+    recall = 'lookup_memory: Fuzzily looks up a previously remembered JSON memo in your memory.\nEXAMPLE:\n\nUSER:\nWhat things did I have to do today?\nASSISTANT:\n<tool name="lookup_memory">\n{"query":"todo list"}\n</tool>\nSYSTEM:\n[{"id": 1, "summary": Todo List for Februrary", "tasks": [{"title": "Send invoices", "due_date":"2025-02-01"}]}]\nASSISTANT:\n<tool name="get_current_time">\n</tool>\nSYSTEM:\n2024-02-01T09:30:03\nASSISTANT:\nLooks like you just had to send invoices today.\n\nAlternative XML format:\n<tool name="lookup_memory">\n<query>todo list</query>\n</tool>'
+    remember = 'create_memory: Remembers a new json note for the future.  Always provide json with a summary prompt that will serve as the lookup vector.  The summary and entire json can be remembered later with lookup_memory.\nEXAMPLE:\n\nUSER:\nRemind me to send invoices on the first of Feburary.\nASSISTANT:\n<tool name="create_memory">\n{ "summary": "todo List for Februrary", "tasks": [{"title": "Send invoices", "due_date":"2025-02-01"}]}\n</tool>\n\nAlternative XML format:\n<tool name="create_memory">\n<summary>todo List for Februrary</summary>\n<tasks>[{"title": "Send invoices", "due_date":"2025-02-01"}]</tasks>\n</tool>'
 
     return {
         'tools': tools_string,
         'lookup_memory': recall,
         'create_memory': remember,
         'memory': recall + remember,
-        'tool_instruction': 'To use a tool write TOOL: in one line followed by the tool name and arguments, system will respond with the results.',
+        'tool_instruction': 'To use a tool, use XML tags like this: <tool name="tool_name">arguments</tool>. Arguments can span multiple lines and can be in JSON format ({"arg": "value"}) or XML format (<arg>value</arg>). For tools with no arguments, use empty tags: <tool name="tool_name"></tool>. The system will respond with the results.',
         'metadata': metadata,
         'provided_system': provided_system
     }
@@ -931,7 +1056,10 @@ class AgentRun(Component):
             thoughts += 1
 
             if thoughts == agent['max_thoughts']:
-                conversation.append({"role": "user", "content": "SYSTEM:\nMaximum tool usage reached. Tools Unavailable"})
+                if is_openai_model(model_name):
+                    conversation.append({"role": "system", "content": "Maximum tool usage reached. Tools Unavailable"})
+                else:
+                    conversation.append({"role": "user", "content": "SYSTEM:\nMaximum tool usage reached. Tools Unavailable"})
 
             # Call the LLM using the dispatch function
             try:
@@ -951,8 +1079,8 @@ class AgentRun(Component):
 
             conversation.append(response)
 
-            if thoughts <= agent['max_thoughts'] and response.get('content') and 'TOOL:' in response['content']:
-                stress_level = self.handle_tool_use(ctx, agent, conversation, response['content'], standard_toolbelt, enabled_mcp_servers, stress_level)
+            if thoughts <= agent['max_thoughts'] and response.get('content') and '<tool name=' in response['content']:
+                stress_level = self.handle_tool_use(ctx, agent, conversation, response['content'], standard_toolbelt, enabled_mcp_servers, stress_level, model_name)
             else:
                 # Allow only one tool per thought.
                 break
@@ -984,35 +1112,28 @@ class AgentRun(Component):
         return f"ERROR: Placeholder framework could not execute tool '{tool_name}' on server '{server_name}'"
 
 
-    def handle_tool_use(self, ctx, agent, conversation, content, standard_toolbelt, enabled_mcp_servers, stress_level):
-        """Handles TOOL: calls, dispatching to standard tools or enabled MCP servers."""
+    def handle_tool_use(self, ctx, agent, conversation, content, standard_toolbelt, enabled_mcp_servers, stress_level, model_name):
+        """Handles tool calls in XML format, dispatching to standard tools or enabled MCP servers."""
         self.last_response.value = conversation[-1]['content'] # Save pre-tool-call response
-        lines = content.split("\n")
-        tool_executed = False # Flag to ensure only one TOOL: line is processed
+        
+        # Look for XML tool tags
+        import re
+        tool_pattern = r'<tool\s+name="([^"]+)">(.*?)</tool>'
+        match = re.search(tool_pattern, content, re.DOTALL)
+        
+        if match:
+            tool_name = match.group(1)
+            tool_args_str = match.group(2).strip()
+            
+            # Clean up agent response to only include text before the tool call
+            pre_tool_text = content[:match.start()].strip()
+            conversation[-1]['content'] = pre_tool_text
 
-        line_num = 0
-        for line in lines:
-            line_num += 1
-            if line.startswith("TOOL:") and not tool_executed:
-                tool_executed = True # Process only the first TOOL: line encountered
+            tool_result = None
+            error_message = None
 
-                # Clean up agent response to only include text before the TOOL: call
-                cleaned_response_lines = lines[:line_num-1] # Exclude the TOOL: line itself
-                conversation[-1]['content'] = '\n'.join(cleaned_response_lines).strip()
-
-                command = line.split(":", 1)[1].strip()
-                try:
-                    tool_name = command.split(" ", 1)[0].strip()
-                    tool_args_str = command.split(" ", 1)[1].strip()
-                except IndexError: # Handle case where there are no arguments
-                    tool_name = command.strip()
-                    tool_args_str = ""
-
-                tool_result = None
-                error_message = None
-
-                # 1. Check Memory Tools (Special Handling)
-                if tool_name == 'lookup_memory':
+            # 1. Check Memory Tools (Special Handling)
+            if tool_name == 'lookup_memory':
                     memory = agent.get('agent_memory')
                     if memory:
                         try:
@@ -1026,22 +1147,22 @@ class AgentRun(Component):
                             traceback.print_exc()
                     else: error_message = "Memory component not available for lookup_memory."
 
-                elif tool_name == 'create_memory':
-                    memory = agent.get('agent_memory')
-                    if memory:
-                        try:
-                            # Attempt to parse args as JSON, otherwise treat as string
-                            try: obj = json.loads(tool_args_str)
-                            except: obj = tool_args_str # Store raw string if not JSON
-                            self.remember_tool(agent, obj, conversation) # remember_tool handles adding to memory
-                            tool_result = f"Memory entry based on '{tool_args_str[:50]}...' stored." # Confirmation message
-                        except Exception as e:
-                            error_message = f"Error during create_memory: {e}"
-                            traceback.print_exc()
-                    else: error_message = "Memory component not available for create_memory."
+            elif tool_name == 'create_memory':
+                memory = agent.get('agent_memory')
+                if memory:
+                    try:
+                        # Attempt to parse args as JSON, otherwise treat as string
+                        try: obj = json.loads(tool_args_str)
+                        except: obj = tool_args_str # Store raw string if not JSON
+                        self.remember_tool(agent, obj, conversation, model_name) # remember_tool handles adding to memory
+                        tool_result = f"Memory entry based on '{tool_args_str[:50]}...' stored." # Confirmation message
+                    except Exception as e:
+                        error_message = f"Error during create_memory: {e}"
+                        traceback.print_exc()
+                else: error_message = "Memory component not available for create_memory."
 
-                # 2. Check Standard Tools
-                elif tool_name in standard_toolbelt:
+            # 2. Check Standard Tools
+            elif tool_name in standard_toolbelt:
                     try:
                         tool_callable = standard_toolbelt[tool_name]
                         tool_result = tool_callable(tool_args_str) # Call the standard tool
@@ -1050,8 +1171,8 @@ class AgentRun(Component):
                         error_message = f"Error executing standard tool '{tool_name}': {e}"
                         traceback.print_exc()
 
-                # 3. Check Enabled MCP Tools
-                else:
+            # 3. Check Enabled MCP Tools
+            else:
                     try:
                         # Query system to find which server (if any) provides this tool
                         server_name = self.query_core_system_for_mcp_tool_server(tool_name)
@@ -1070,38 +1191,42 @@ class AgentRun(Component):
                          traceback.print_exc()
 
 
-                # Append result or error to conversation
-                if error_message:
-                    print(f"Tool execution failed for '{tool_name}': {error_message}", flush=True)
+            # Append result or error to conversation
+            if error_message:
+                print(f"Tool execution failed for '{tool_name}': {error_message}", flush=True)
+                if is_openai_model(model_name):
+                    conversation.append({"role": "system", "content": f"ERROR: {error_message}"})
+                else:
                     conversation.append({"role": "user", "content": f"SYSTEM:\nERROR: {error_message}"})
-                    stress_level = min(stress_level + 0.1, 1.5) # Increase stress on error
-                elif tool_result is not None:
-                     # Ensure result is a string, handle potential non-string returns gracefully
-                    result_str = str(tool_result)
-                    if result_str:
-                         conversation.append({"role": "user", "content": f"SYSTEM:\n{result_str}"})
+                stress_level = min(stress_level + 0.1, 1.5) # Increase stress on error
+            elif tool_result is not None:
+                 # Ensure result is a string, handle potential non-string returns gracefully
+                result_str = str(tool_result)
+                if result_str:
+                    if is_openai_model(model_name):
+                        conversation.append({"role": "system", "content": result_str})
                     else:
-                         conversation.append({"role": "user", "content": "SYSTEM:\nTool executed successfully with empty result."})
-                    # Potentially decrease stress on success? stress_level = max(0, stress_level - 0.05)
-                # else: tool had no result and no error (e.g., create_memory handled its own confirmation)
+                        conversation.append({"role": "user", "content": f"SYSTEM:\n{result_str}"})
+                else:
+                    if is_openai_model(model_name):
+                        conversation.append({"role": "system", "content": "Tool executed successfully with empty result."})
+                    else:
+                        conversation.append({"role": "user", "content": "SYSTEM:\nTool executed successfully with empty result."})
+                 # Potentially decrease stress on success? stress_level = max(0, stress_level - 0.05)
+            # else: tool had no result and no error (e.g., create_memory handled its own confirmation)
 
-                # Give on_thought a chance to see the result/error
-                self.out_conversation.value = conversation
-                if hasattr(self, 'on_thought') and self.on_thought:
-                     SubGraphExecutor(self.on_thought).do(ctx)
-
-                # IMPORTANT: Break after processing the first TOOL: line
-                break
-            # End of if line.startswith("TOOL:")
-
-        # If no TOOL: line was found in the response content
-        if not tool_executed:
-             self.last_response.value = content # Update last response if no tool was called
+            # Give on_thought a chance to see the result/error
+            self.out_conversation.value = conversation
+            if hasattr(self, 'on_thought') and self.on_thought:
+                 SubGraphExecutor(self.on_thought).do(ctx)
+        else:
+            # No tool was found in the response
+            self.last_response.value = content
 
         return stress_level
 
 
-    def remember_tool(self, agent, tool_args, conversation):
+    def remember_tool(self, agent, tool_args, conversation, model_name=None):
         memory = agent['agent_memory']
         if isinstance(tool_args, str):
             prompt_start = tool_args.find('"')
@@ -1121,7 +1246,11 @@ class AgentRun(Component):
 
         memory.add('', prompt, json_memo)
         print(f"Added {prompt}: {memo} to memory", flush=True)
-        conversation.append({"role": "user", "content": f"SYSTEM:\nMemory {prompt} stored."})
+        
+        if model_name and is_openai_model(model_name):
+            conversation.append({"role": "system", "content": f"Memory {prompt} stored."})
+        else:
+            conversation.append({"role": "user", "content": f"SYSTEM:\nMemory {prompt} stored."})
 
     # Note: run_tool is removed as its logic is now integrated into handle_tool_use
 
@@ -1186,22 +1315,39 @@ class AgentRunTool(Component):
                  tool_result = tool(args)
 
             # Append the tool usage to the copied conversation
-            current_conversation.append({"role": "assistant", "content": f"TOOL: {self.tool_name.value} {self.tool_args.value}"})
+            current_conversation.append({"role": "assistant", "content": f'<tool name="{self.tool_name.value}">\n{self.tool_args.value}\n</tool>'})
 
             if tool_result != '':
-                current_conversation.append({"role": "user", "content": "SYSTEM:\n" + str(tool_result)}) # Use SYSTEM role for results
+                # Check if we can determine the model from the agent context
+                model_name = agent_context.get('agent_model', '')
+                if is_openai_model(model_name):
+                    current_conversation.append({"role": "system", "content": str(tool_result)})
+                else:
+                    current_conversation.append({"role": "user", "content": "SYSTEM:\n" + str(tool_result)})
             else:
-                current_conversation.append({"role": "user", "content": "SYSTEM:\nEmpty string result"}) # Use SYSTEM role
+                model_name = agent_context.get('agent_model', '')
+                if is_openai_model(model_name):
+                    current_conversation.append({"role": "system", "content": "Empty string result"})
+                else:
+                    current_conversation.append({"role": "user", "content": "SYSTEM:\nEmpty string result"})
 
             self.tool_output.value = str(tool_result)
             self.updated_conversation.value = current_conversation
         except KeyError:
             error_message = f"ERROR: TOOL '{self.tool_name.value}' not found."
-            current_conversation.append({"role": "user", "content": "SYSTEM:\n" + error_message}) # Use SYSTEM role
+            model_name = agent_context.get('agent_model', '')
+            if is_openai_model(model_name):
+                current_conversation.append({"role": "system", "content": error_message})
+            else:
+                current_conversation.append({"role": "user", "content": "SYSTEM:\n" + error_message})
             self.updated_conversation.value = current_conversation
         except Exception as e:
             error_message = f"ERROR: An exception occurred while running the tool: {str(e)}"
-            current_conversation.append({"role": "user", "content": "SYSTEM:\n" + error_message}) # Use SYSTEM role
+            model_name = agent_context.get('agent_model', '')
+            if is_openai_model(model_name):
+                current_conversation.append({"role": "system", "content": error_message})
+            else:
+                current_conversation.append({"role": "user", "content": "SYSTEM:\n" + error_message})
             self.updated_conversation.value = current_conversation
 
 
@@ -1235,6 +1381,7 @@ class AgentLearn(Component):
 
         model_name = agent['agent_model']
         toolbelt = agent['agent_toolbelt']
+        enabled_mcp_servers = agent.get('enabled_mcp_servers', [])
         system_prompt = agent['agent_system_prompt']
         metadata = self.metadata.value
 
@@ -1242,9 +1389,9 @@ class AgentLearn(Component):
         conversation = copy.deepcopy(self.conversation.value)
 
         if conversation[0]['role'] != 'system':
-            conversation.insert(0, {'role': 'system', 'content': system_prompt.format(**make_tools_prompt(toolbelt, metadata))})
+            conversation.insert(0, {'role': 'system', 'content': system_prompt.format(**make_tools_prompt(toolbelt, enabled_mcp_servers, metadata))})
         else:
-            conversation[0]['content'] = system_prompt.format(**make_tools_prompt(toolbelt, metadata))
+            conversation[0]['content'] = system_prompt.format(**make_tools_prompt(toolbelt, enabled_mcp_servers, metadata))
 
         # Add system message to use memory tools
         memory_instruction = {
@@ -1260,7 +1407,10 @@ class AgentLearn(Component):
             thoughts += 1
 
             if thoughts == agent['max_thoughts']:
-                conversation.append({"role": "user", "content": "SYSTEM:\nMaximum tool usage reached. Tools Unavailable"})
+                if is_openai_model(model_name):
+                    conversation.append({"role": "system", "content": "Maximum tool usage reached. Tools Unavailable"})
+                else:
+                    conversation.append({"role": "user", "content": "SYSTEM:\nMaximum tool usage reached. Tools Unavailable"})
 
             if agent['agent_provider'] == 'vertexai':
                 response = self.run_vertexai(ctx, model_name, conversation, stress_level)
@@ -1273,8 +1423,8 @@ class AgentLearn(Component):
 
             conversation.append(response)
 
-            if thoughts <= agent['max_thoughts'] and 'TOOL:' in response['content']:
-                stress_level = self.handle_tool_use(ctx, agent, conversation, response['content'], toolbelt, stress_level)
+            if thoughts <= agent['max_thoughts'] and '<tool name=' in response['content']:
+                stress_level = self.handle_tool_use(ctx, agent, conversation, response['content'], toolbelt, enabled_mcp_servers, stress_level, model_name)
             else:
                 # Allow only one tool per thought.
                 break
@@ -1421,7 +1571,7 @@ class AgentLearn(Component):
     # The call in AgentLearn.execute (line 908) will now correctly call the modified AgentRun.handle_tool_use
     pass # Placeholder for the removal diffs below
 
-    def remember_tool(self, agent, tool_args, conversation):
+    def remember_tool(self, agent, tool_args, conversation, model_name=None):
         memory = agent['agent_memory']
         if isinstance(tool_args, str):
             prompt_start = tool_args.find('"')
@@ -1441,7 +1591,11 @@ class AgentLearn(Component):
 
         memory.add('', prompt, json_memo)
         print(f"Added {prompt}: {memo} to memory", flush=True)
-        conversation.append({"role": "user", "content": f"SYSTEM:\nMemory {prompt} stored."})
+        
+        if model_name and is_openai_model(model_name):
+            conversation.append({"role": "system", "content": f"Memory {prompt} stored."})
+        else:
+            conversation.append({"role": "user", "content": f"SYSTEM:\nMemory {prompt} stored."})
 
     # Note: run_tool is removed from AgentLearn to inherit from AgentRun (where it's also removed)
 
