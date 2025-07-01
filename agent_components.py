@@ -45,31 +45,30 @@ def convert_old_tool_syntax_to_xml(text: str) -> str:
     
     # Pattern to match old style: TOOL: tool_name args (args optional)
     # This pattern captures tool name and optional arguments
+    # Match the entire line including any trailing spaces but not the newline
     old_tool_pattern = r'^(\s*)TOOL:\s+(\w+)(?:\s+(.*))?$'
     
-    lines = text.split('\n')
-    converted_lines = []
-    
-    for line in lines:
-        match = re.match(old_tool_pattern, line)
-        if match:
-            indent = match.group(1)
-            tool_name = match.group(2)
-            args = match.group(3) if match.group(3) else ''
-            
-            # Convert to XML format
+    def replace_match(match):
+        indent = match.group(1)
+        tool_name = match.group(2)
+        args = match.group(3) if match.group(3) else ''
+        
+        # Convert to XML format
+        if args:
+            # If args exist, check if they should be on same line or new line
+            args = args.strip()
             if args:
-                # If args exist, put them on a new line for better readability
-                converted_lines.append(f'{indent}<tool name="{tool_name}">')
-                converted_lines.append(f'{indent}{args}')
-                converted_lines.append(f'{indent}</tool>')
+                return f'{indent}<tool name="{tool_name}">\n{indent}{args}\n{indent}</tool>'
             else:
-                # No args, single line format
-                converted_lines.append(f'{indent}<tool name="{tool_name}"></tool>')
+                return f'{indent}<tool name="{tool_name}"></tool>'
         else:
-            converted_lines.append(line)
+            # No args, single line format
+            return f'{indent}<tool name="{tool_name}"></tool>'
     
-    return '\n'.join(converted_lines)
+    # Replace all occurrences in the text
+    converted_text = re.sub(old_tool_pattern, replace_match, text, flags=re.MULTILINE)
+    
+    return converted_text
 
 def parse_xml_args_to_dict(xml_content: str) -> dict:
     """Parse XML-style arguments into a dictionary using a simple SAX-like approach.
@@ -428,19 +427,20 @@ class AgentMakeToolbelt(Component):
         mcp_servers = []
         toolbelt_name = self.name.value if self.name.value is not None else 'default'
         
-        # Process standard tools defined via AgentDefineTool
+        # Process standard tools defined via AgentDefineTool or devcore tools
         standard_tool_key = f"toolbelt_{toolbelt_name}"
         if standard_tool_key in ctx:
             for tool_name, tool_component in ctx[standard_tool_key].items():
-                if isinstance(tool_component, AgentDefineTool):
+                # Handle any component that has a tool_ref attribute (AgentDefineTool, devcore tools, etc.)
+                if hasattr(tool_component, 'tool_ref'):
                     # Ensure the tool definition is executed to populate tool_ref
                     tool_component.execute(ctx)
-                    if tool_component.tool_ref.value:
+                    if hasattr(tool_component, 'tool_ref') and tool_component.tool_ref.value:
                          # Store the actual callable tool instance
                         standard_tools[tool_component.tool_ref.value.name] = tool_component.tool_ref.value
                     else:
-                        print(f"Warning: AgentDefineTool '{tool_name}' did not produce a tool reference.")
-                # Note: We ignore non-AgentDefineTool items here, MCP servers are handled next
+                        print(f"Warning: Tool component '{tool_name}' did not produce a tool reference.")
+                # Note: We ignore components without tool_ref here, MCP servers are handled next
 
         # Retrieve declared MCP server names
         mcp_server_list_key = f"mcp_servers_{toolbelt_name}"
@@ -929,7 +929,12 @@ def _run_llm_vertexai(ctx, model_name, conversation, temperature):
 
 def _run_llm_openai(ctx, model_name, conversation, temperature):
     """Calls the OpenAI API."""
-    print("Calling OpenAI...")
+    #print("Calling OpenAI...")
+    #print(f"Model: {model_name}")
+    #print(f"Temperature: {temperature}")
+    #print("Conversation:", flush=True)
+    #print(conversation, flush=True)
+    
     if 'openai' not in globals():
         raise ImportError("OpenAI library not available or imported.")
 
@@ -968,7 +973,9 @@ def _run_llm_openai(ctx, model_name, conversation, temperature):
              response_content = completion.choices[0].message.content or "" # Handle None content
 
         response = {"role": "assistant", "content": response_content}
-        print("OpenAI response processed.")
+        #print("Got raw response:", flush=True)
+        #print(response, flush=True)
+        #print("OpenAI response processed.")
         return response
     except Exception as e:
         print(f"Error during OpenAI API call: {e}")
