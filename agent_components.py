@@ -1008,6 +1008,45 @@ def _dispatch_llm_call(ctx, provider, model_name, conversation, temperature):
 # --- End Standalone LLM Call Functions ---
 
 
+# --- Duplicate Tool Call Prevention Functions ---
+
+def normalize_tool_args(args_dict):
+    """Remove _nonce and _duplicate_reasoning from args for comparison"""
+    if args_dict is None:
+        return None
+    normalized = args_dict.copy()
+    normalized.pop('_nonce', None)
+    normalized.pop('_duplicate_reasoning', None)
+    return normalized
+
+def extract_nonce_and_reasoning(args_dict):
+    """Extract _nonce and _duplicate_reasoning from parsed args"""
+    if args_dict is None:
+        return None, None
+    return args_dict.get('_nonce'), args_dict.get('_duplicate_reasoning')
+
+def is_duplicate_tool_call(tool_name, args_dict, tool_history):
+    """Check if this tool call is a duplicate of a previous call"""
+    normalized_args = normalize_tool_args(args_dict)
+    
+    for prev_call in tool_history:
+        if (prev_call['tool_name'] == tool_name and 
+            prev_call['normalized_args'] == normalized_args):
+            return True
+    return False
+
+def is_reasoning_unique(reasoning, tool_history):
+    """Check if the reasoning is unique within the current tool history"""
+    if reasoning is None or reasoning.strip() == "":
+        return False
+    
+    used_reasoning = [call.get('reasoning') for call in tool_history 
+                     if call.get('reasoning') is not None]
+    return reasoning not in used_reasoning
+
+# --- End Duplicate Tool Call Prevention Functions ---
+
+
 @xai_component
 class AgentRun(Component):
     """Run the agent with the given conversation.
@@ -1032,8 +1071,15 @@ class AgentRun(Component):
 
     out_conversation: OutArg[list]
     last_response: OutArg[str]
+    
+    def __init__(self):
+        super().__init__()
+        # Track tool calls within this AgentRun instance to prevent duplicates
+        self.tool_call_history = []
 
     def execute(self, ctx) -> None:
+        # Reset tool call history for this execution
+        self.tool_call_history = []
         try:
             self.do_execute(ctx)
         except Exception as e:
@@ -1144,6 +1190,58 @@ class AgentRun(Component):
             # Clean up agent response to only include text before the tool call
             pre_tool_text = content[:match.start()].strip()
             conversation[-1]['content'] = pre_tool_text
+
+            # Parse tool arguments to check for duplicates
+            parsed_args, _ = parse_tool_args(tool_args_str)
+            nonce, reasoning = extract_nonce_and_reasoning(parsed_args)
+            
+            # Check for duplicate tool calls
+            if is_duplicate_tool_call(tool_name, parsed_args, self.tool_call_history):
+                if reasoning is None or reasoning.strip() == "":
+                    # Duplicate call without reasoning - block it
+                    error_message = f"Duplicate tool call detected for '{tool_name}' with same arguments. To retry this tool, provide '_duplicate_reasoning' parameter with unique justification."
+                    print(f"Blocked duplicate tool call: {tool_name} with args: {normalize_tool_args(parsed_args)}")
+                    
+                    if is_openai_model(model_name):
+                        conversation.append({"role": "system", "content": f"ERROR: {error_message}"})
+                    else:
+                        conversation.append({"role": "user", "content": f"SYSTEM:\nERROR: {error_message}"})
+                    
+                    # Give on_thought a chance to see the error
+                    self.out_conversation.value = conversation
+                    if hasattr(self, 'on_thought') and self.on_thought:
+                        SubGraphExecutor(self.on_thought).do(ctx)
+                    
+                    return min(stress_level + 0.1, 1.5) # Increase stress due to blocked duplicate
+                
+                elif not is_reasoning_unique(reasoning, self.tool_call_history):
+                    # Duplicate call with non-unique reasoning - block it
+                    error_message = f"Duplicate tool call detected for '{tool_name}' with previously used reasoning: '{reasoning}'. Please provide unique justification."
+                    print(f"Blocked duplicate tool call with reused reasoning: {tool_name}")
+                    
+                    if is_openai_model(model_name):
+                        conversation.append({"role": "system", "content": f"ERROR: {error_message}"})
+                    else:
+                        conversation.append({"role": "user", "content": f"SYSTEM:\nERROR: {error_message}"})
+                    
+                    # Give on_thought a chance to see the error
+                    self.out_conversation.value = conversation
+                    if hasattr(self, 'on_thought') and self.on_thought:
+                        SubGraphExecutor(self.on_thought).do(ctx)
+                    
+                    return min(stress_level + 0.1, 1.5) # Increase stress due to blocked duplicate
+                
+                else:
+                    # Duplicate call with unique reasoning - allow it
+                    print(f"Allowing duplicate tool call '{tool_name}' with unique reasoning: '{reasoning}'")
+
+            # Record this tool call in history (before execution in case of errors)
+            tool_call_record = {
+                'tool_name': tool_name,
+                'normalized_args': normalize_tool_args(parsed_args),
+                'reasoning': reasoning
+            }
+            self.tool_call_history.append(tool_call_record)
 
             tool_result = None
             error_message = None
