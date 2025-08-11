@@ -932,11 +932,11 @@ def _run_llm_vertexai(ctx, model_name, conversation, temperature):
 
 def _run_llm_openai(ctx, model_name, conversation, temperature):
     """Calls the OpenAI API."""
-    print("Calling OpenAI...")
-    print(f"Model: {model_name}")
-    print(f"Temperature: {temperature}")
-    print("Conversation:", flush=True)
-    print(conversation, flush=True)
+    #print("Calling OpenAI...")
+    #print(f"Model: {model_name}")
+    #print(f"Temperature: {temperature}")
+    #print("Conversation:", flush=True)
+    #print(conversation, flush=True)
     
     if 'openai' not in globals():
         raise ImportError("OpenAI library not available or imported.")
@@ -982,9 +982,9 @@ def _run_llm_openai(ctx, model_name, conversation, temperature):
              response_content = completion.choices[0].message.content or "" # Handle None content
 
         response = {"role": "assistant", "content": response_content}
-        print("Got raw response:", flush=True)
-        print(response, flush=True)
-        print("OpenAI response processed.")
+        #print("Got raw response:", flush=True)
+        #print(response, flush=True)
+        #print("OpenAI response processed.")
         return response
     except Exception as e:
         print(f"Error during OpenAI API call: {e}")
