@@ -1040,9 +1040,11 @@ def is_reasoning_unique(reasoning, tool_history):
     if reasoning is None or reasoning.strip() == "":
         return False
     
-    used_reasoning = [call.get('reasoning') for call in tool_history 
-                     if call.get('reasoning') is not None]
-    return reasoning not in used_reasoning
+    # Normalize reasoning by stripping whitespace for comparison
+    normalized_reasoning = reasoning.strip()
+    used_reasoning = [call.get('reasoning', '').strip() for call in tool_history 
+                     if call.get('reasoning') is not None and call.get('reasoning').strip() != ""]
+    return normalized_reasoning not in used_reasoning
 
 # --- End Duplicate Tool Call Prevention Functions ---
 
@@ -1239,7 +1241,7 @@ class AgentRun(Component):
             tool_call_record = {
                 'tool_name': tool_name,
                 'normalized_args': normalize_tool_args(parsed_args),
-                'reasoning': reasoning
+                'reasoning': reasoning.strip() if reasoning else None
             }
             self.tool_call_history.append(tool_call_record)
 
@@ -1489,8 +1491,15 @@ class AgentLearn(Component):
 
     out_conversation: OutArg[list]
     last_response: OutArg[str]
+    
+    def __init__(self):
+        super().__init__()
+        # Track tool calls within this AgentLearn instance to prevent duplicates
+        self.tool_call_history = []
 
     def execute(self, ctx) -> None:
+        # Reset tool call history for this execution
+        self.tool_call_history = []
         agent = ctx['agent_' + self.agent_name.value]
 
         model_name = agent['agent_model']
