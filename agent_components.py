@@ -37,6 +37,9 @@ def is_openai_model(model_name: str) -> bool:
     """Check if the model is an OpenAI model that supports system messages."""
     if not model_name:
         return False
+    if model_name.startswith('gpt-5'):
+        return False
+    
     return model_name.startswith(('o1', 'o3', 'o4', 'gpt'))
 
 def convert_old_tool_syntax_to_xml(text: str) -> str:
@@ -929,11 +932,11 @@ def _run_llm_vertexai(ctx, model_name, conversation, temperature):
 
 def _run_llm_openai(ctx, model_name, conversation, temperature):
     """Calls the OpenAI API."""
-    #print("Calling OpenAI...")
-    #print(f"Model: {model_name}")
-    #print(f"Temperature: {temperature}")
-    #print("Conversation:", flush=True)
-    #print(conversation, flush=True)
+    print("Calling OpenAI...")
+    print(f"Model: {model_name}")
+    print(f"Temperature: {temperature}")
+    print("Conversation:", flush=True)
+    print(conversation, flush=True)
     
     if 'openai' not in globals():
         raise ImportError("OpenAI library not available or imported.")
@@ -943,7 +946,7 @@ def _run_llm_openai(ctx, model_name, conversation, temperature):
         conversation = conversation[:-1]
 
     try:
-        if model_name.startswith('o1') or model_name.startswith('o3') or model_name.startswith('o4'):
+        if model_name.startswith('o1') or model_name.startswith('o3') or model_name.startswith('o4') or model_name.startswith('gpt-5'):
             reasoning_effort = 'low'
             if temperature > 0.3:
                 reasoning_effort = 'medium'
@@ -955,6 +958,12 @@ def _run_llm_openai(ctx, model_name, conversation, temperature):
                 messages=conversation,
                 max_completion_tokens=8192,
                 reasoning_effort=reasoning_effort
+            )
+        if model_name.startswith('grok-4'):
+            completion = openai.chat.completions.create(
+                model=model_name,
+                messages=conversation,
+                max_completion_tokens=8192
             )
         else:
             params = {
@@ -973,9 +982,9 @@ def _run_llm_openai(ctx, model_name, conversation, temperature):
              response_content = completion.choices[0].message.content or "" # Handle None content
 
         response = {"role": "assistant", "content": response_content}
-        #print("Got raw response:", flush=True)
-        #print(response, flush=True)
-        #print("OpenAI response processed.")
+        print("Got raw response:", flush=True)
+        print(response, flush=True)
+        print("OpenAI response processed.")
         return response
     except Exception as e:
         print(f"Error during OpenAI API call: {e}")
@@ -1531,7 +1540,7 @@ class AgentLearn(Component):
         if conversation[-1]['role'] == 'assistant' and conversation[-1]['content'] == '':
             conversation.pop()
 
-        if model_name.startswith('o1') or model_name.startswith('o3'):
+        if model_name.startswith('o1') or model_name.startswith('o3') or model_name.startswith('o4') or model_name.startswith('gpt-5'):
             reasoning_effort = 'low'
             if stress_level > 0.3:
                 reasoning_effort = 'medium'
