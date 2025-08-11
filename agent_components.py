@@ -37,6 +37,9 @@ def is_openai_model(model_name: str) -> bool:
     """Check if the model is an OpenAI model that supports system messages."""
     if not model_name:
         return False
+    if model_name.startswith('gpt-5'):
+        return False
+    
     return model_name.startswith(('o1', 'o3', 'o4', 'gpt'))
 
 def convert_old_tool_syntax_to_xml(text: str) -> str:
@@ -943,7 +946,7 @@ def _run_llm_openai(ctx, model_name, conversation, temperature):
         conversation = conversation[:-1]
 
     try:
-        if model_name.startswith('o1') or model_name.startswith('o3') or model_name.startswith('o4'):
+        if model_name.startswith('o1') or model_name.startswith('o3') or model_name.startswith('o4') or model_name.startswith('gpt-5'):
             reasoning_effort = 'low'
             if temperature > 0.3:
                 reasoning_effort = 'medium'
@@ -955,6 +958,12 @@ def _run_llm_openai(ctx, model_name, conversation, temperature):
                 messages=conversation,
                 max_completion_tokens=8192,
                 reasoning_effort=reasoning_effort
+            )
+        if model_name.startswith('grok-4'):
+            completion = openai.chat.completions.create(
+                model=model_name,
+                messages=conversation,
+                max_completion_tokens=8192
             )
         else:
             params = {
@@ -1531,7 +1540,7 @@ class AgentLearn(Component):
         if conversation[-1]['role'] == 'assistant' and conversation[-1]['content'] == '':
             conversation.pop()
 
-        if model_name.startswith('o1') or model_name.startswith('o3'):
+        if model_name.startswith('o1') or model_name.startswith('o3') or model_name.startswith('o4') or model_name.startswith('gpt-5'):
             reasoning_effort = 'low'
             if stress_level > 0.3:
                 reasoning_effort = 'medium'
