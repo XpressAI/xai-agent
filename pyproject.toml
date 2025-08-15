@@ -17,5 +17,5 @@ dependencies = [
 
 # Xircuits-specific configurations
 [tool.xircuits]
-default_example_path = "agent_example.xircuits"
+default_example_path = "examples/agent_example.xircuits"
 requirements_path = "requirements.txt"
