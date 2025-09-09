@@ -529,6 +529,7 @@ class AgentInit(Component):
       {tool_instruction} and {tools} to explain how to use them.
     - max_thoughts: The maximum number of thoughts/tools the agent can use before it must respond to the user.
     - toolbelt_spec: The toolbelt the agent has access to.
+    - tool_mode: The tool calling mode ('xml' or 'openai'). Defaults to 'xml' for backward compatibility.
     """
 
     agent_name: InCompArg[str]
@@ -538,11 +539,17 @@ class AgentInit(Component):
     system_prompt: InCompArg[str]
     max_thoughts: InArg[int]
     toolbelt_spec: InCompArg[dict]
+    tool_mode: InArg[str]
     
     def execute(self, ctx) -> None:
         provider = self.agent_provider.value
         if provider not in ['openai', 'vertexai', 'bedrock']:
             raise Exception(f"Agent provider '{provider}' is not supported.")
+
+        # Default to 'xml' mode for backward compatibility
+        tool_mode = self.tool_mode.value if self.tool_mode.value is not None else 'xml'
+        if tool_mode not in ['xml', 'openai']:
+            raise Exception(f"Tool mode '{tool_mode}' is not supported. Use 'xml' or 'openai'.")
 
         agent_context_key = 'agent_' + self.agent_name.value
         ctx[agent_context_key] = {
@@ -554,7 +561,8 @@ class AgentInit(Component):
             'agent_memory': self.agent_memory.value,
             'agent_model': self.agent_model.value,
             'agent_system_prompt': self.system_prompt.value,
-            'max_thoughts': self.max_thoughts.value if self.max_thoughts.value is not None else 5 # Default max_thoughts
+            'max_thoughts': self.max_thoughts.value if self.max_thoughts.value is not None else 5, # Default max_thoughts
+            'tool_mode': tool_mode
         }
 
 
@@ -755,8 +763,124 @@ def query_core_system_for_mcp_tools(server_name: str) -> list:
          return [{"name": "get_forecast", "description": "Gets weather forecast"}]
     return []
 
-def make_tools_prompt(standard_toolbelt: dict, enabled_mcp_servers: list, metadata: dict, provided_system: str=None) -> dict:
+def convert_tools_to_openai_format(standard_toolbelt: dict, enabled_mcp_servers: list) -> list:
+    """Converts tools to OpenAI function calling format."""
+    openai_tools = []
+    
+    # Add standard tools
+    for key, value in standard_toolbelt.items():
+        desc = getattr(value, 'description', 'No description available.')
+        # Clean up description for OpenAI format
+        desc = desc.replace('<tool name="', '').replace('</tool>', '').replace('\n', ' ').strip()
+        
+        tool_def = {
+            "type": "function",
+            "function": {
+                "name": key,
+                "description": desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": "The input arguments for the tool"
+                        }
+                    },
+                    "required": ["input"]
+                }
+            }
+        }
+        openai_tools.append(tool_def)
+    
+    # Add MCP tools
+    for server_name in enabled_mcp_servers:
+        try:
+            mcp_tools = query_core_system_for_mcp_tools(server_name)
+            for tool_info in mcp_tools:
+                desc = tool_info["description"].replace('\n', ' ').strip()
+                tool_def = {
+                    "type": "function", 
+                    "function": {
+                        "name": tool_info["name"],
+                        "description": desc,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "input": {
+                                    "type": "string",
+                                    "description": "The input arguments for the tool"
+                                }
+                            },
+                            "required": ["input"]
+                        }
+                    }
+                }
+                openai_tools.append(tool_def)
+        except Exception as e:
+            print(f"Error querying MCP tools for server '{server_name}': {e}")
+    
+    # Add memory tools
+    memory_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_memory",
+                "description": "Fuzzily looks up a previously remembered JSON memo in your memory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query to find relevant memories"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "create_memory",
+                "description": "Remembers a new JSON note for the future. Always provide JSON with a summary prompt that will serve as the lookup vector.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string", 
+                            "description": "A brief summary that will serve as the lookup vector"
+                        },
+                        "data": {
+                            "type": "object",
+                            "description": "The JSON data to remember"
+                        }
+                    },
+                    "required": ["summary", "data"]
+                }
+            }
+        }
+    ]
+    
+    openai_tools.extend(memory_tools)
+    return openai_tools
+
+def make_tools_prompt(standard_toolbelt: dict, enabled_mcp_servers: list, metadata: dict, provided_system: str=None, tool_mode: str='xml') -> dict:
     """Generates the tool descriptions for the system prompt, including standard and MCP tools."""
+    if tool_mode == 'openai':
+        # For OpenAI mode, we return the tools in OpenAI format and minimal instruction
+        openai_tools = convert_tools_to_openai_format(standard_toolbelt, enabled_mcp_servers)
+        return {
+            'tools': [],
+            'openai_tools': openai_tools,
+            'lookup_memory': '',
+            'create_memory': '',
+            'memory': '',
+            'tool_instruction': 'You have access to function calling. Use the available functions when appropriate.',
+            'metadata': metadata,
+            'provided_system': provided_system
+        }
+    
+    # XML mode (original functionality)
     tool_desc_parts = []
 
     # 1. Add standard tools
@@ -787,6 +911,7 @@ def make_tools_prompt(standard_toolbelt: dict, enabled_mcp_servers: list, metada
 
     return {
         'tools': tools_string,
+        'openai_tools': [],
         'lookup_memory': recall,
         'create_memory': remember,
         'memory': recall + remember,
@@ -930,7 +1055,7 @@ def _run_llm_vertexai(ctx, model_name, conversation, temperature):
         raise # Re-raise the exception
 
 
-def _run_llm_openai(ctx, model_name, conversation, temperature):
+def _run_llm_openai(ctx, model_name, conversation, temperature, tools=None):
     """Calls the OpenAI API."""
     #print("Calling OpenAI...")
     #print(f"Model: {model_name}")
@@ -953,18 +1078,26 @@ def _run_llm_openai(ctx, model_name, conversation, temperature):
             elif temperature > 0.5:
                 reasoning_effort = 'high'
                 
-            completion = openai.chat.completions.create(
-                model=model_name,
-                messages=conversation,
-                max_completion_tokens=8192,
-                reasoning_effort=reasoning_effort
-            )
-        if model_name.startswith('grok-4'):
-            completion = openai.chat.completions.create(
-                model=model_name,
-                messages=conversation,
-                max_completion_tokens=8192
-            )
+            params = {
+                "model": model_name,
+                "messages": conversation,
+                "max_completion_tokens": 8192,
+                "reasoning_effort": reasoning_effort
+            }
+            if tools:
+                params["tools"] = tools
+                
+            completion = openai.chat.completions.create(**params)
+        elif model_name.startswith('grok-4'):
+            params = {
+                "model": model_name,
+                "messages": conversation,
+                "max_completion_tokens": 8192
+            }
+            if tools:
+                params["tools"] = tools
+                
+            completion = openai.chat.completions.create(**params)
         else:
             params = {
                 "model": model_name,
@@ -974,14 +1107,34 @@ def _run_llm_openai(ctx, model_name, conversation, temperature):
                 "temperature": temperature,
                 "response_format": { "type": "text" }
             }
+            if tools:
+                params["tools"] = tools
+                params.pop("response_format", None)  # Remove response_format when using tools
+                
             completion = openai.chat.completions.create(**params)
 
-        # Ensure message content is accessed correctly
-        response_content = ""
-        if completion.choices and completion.choices[0].message:
-             response_content = completion.choices[0].message.content or "" # Handle None content
+        # Handle response with potential tool calls
+        choice = completion.choices[0]
+        message = choice.message
+        
+        response = {
+            "role": "assistant", 
+            "content": message.content or ""
+        }
+        
+        # Check if there are tool calls
+        if hasattr(message, 'tool_calls') and message.tool_calls:
+            response["tool_calls"] = []
+            for tool_call in message.tool_calls:
+                response["tool_calls"].append({
+                    "id": tool_call.id,
+                    "type": tool_call.type,
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments
+                    }
+                })
 
-        response = {"role": "assistant", "content": response_content}
         #print("Got raw response:", flush=True)
         #print(response, flush=True)
         #print("OpenAI response processed.")
@@ -992,11 +1145,11 @@ def _run_llm_openai(ctx, model_name, conversation, temperature):
         raise # Re-raise the exception
 
 
-def _dispatch_llm_call(ctx, provider, model_name, conversation, temperature):
+def _dispatch_llm_call(ctx, provider, model_name, conversation, temperature, tools=None):
     """Dispatches the LLM call to the appropriate provider function."""
     print(f"Dispatching LLM call to provider: {provider}")
     if provider == 'openai':
-        return _run_llm_openai(ctx, model_name, conversation, temperature)
+        return _run_llm_openai(ctx, model_name, conversation, temperature, tools)
     elif provider == 'vertexai':
         return _run_llm_vertexai(ctx, model_name, conversation, temperature)
     elif provider == 'bedrock':
@@ -1090,14 +1243,14 @@ class AgentRun(Component):
         standard_toolbelt = agent['agent_toolbelt'] # Now contains only standard tools
         enabled_mcp_servers = agent.get('enabled_mcp_servers', []) # Get the list of enabled MCP servers
         system_prompt = agent['agent_system_prompt']
+        tool_mode = agent.get('tool_mode', 'xml')  # Get tool mode, default to xml
 
         # deep to avoid messing with the original system prompt.
         conversation = copy.deepcopy(self.conversation.value)
 
         metadata = self.metadata.value
         
-
-        prompt_args = make_tools_prompt(standard_toolbelt, enabled_mcp_servers, metadata)
+        prompt_args = make_tools_prompt(standard_toolbelt, enabled_mcp_servers, metadata, tool_mode=tool_mode)
 
         if conversation[0]['role'] != 'system':
             # Insert new system prompt if none exists
@@ -1120,6 +1273,11 @@ class AgentRun(Component):
                 else:
                     conversation.append({"role": "user", "content": "SYSTEM:\nMaximum tool usage reached. Tools Unavailable"})
 
+            # Prepare tools for OpenAI mode
+            tools_param = None
+            if tool_mode == 'openai' and agent['agent_provider'] == 'openai':
+                tools_param = prompt_args.get('openai_tools', [])
+
             # Call the LLM using the dispatch function
             try:
                 response = _dispatch_llm_call(
@@ -1127,7 +1285,8 @@ class AgentRun(Component):
                     agent['agent_provider'],
                     model_name,
                     conversation,
-                    temperature=stress_level + 0.5 # Default temperature logic
+                    temperature=stress_level + 0.5, # Default temperature logic
+                    tools=tools_param
                 )
             except Exception as e:
                  print(f"Error during LLM call in AgentRun: {e}")
@@ -1138,14 +1297,22 @@ class AgentRun(Component):
 
             conversation.append(response)
 
-            # HACK: support buggy output that happens offten in glm-4.5.
-            # Might be able to remove if we use native tool support.
-            if '<toolname=' in response['content']:
-                response['content'] = response['content'].replace('<toolname=', '<tool name=')
-            
-            if thoughts <= agent['max_thoughts'] and response.get('content') and '<tool name=' in response['content']:
-                stress_level = self.handle_tool_use(ctx, agent, conversation, response['content'], standard_toolbelt, enabled_mcp_servers, stress_level, model_name)
-            else:
+            # Handle tool calls based on mode
+            has_tools = False
+            if tool_mode == 'openai' and 'tool_calls' in response:
+                # OpenAI tool calling mode
+                has_tools = True
+                stress_level = self.handle_openai_tool_calls(ctx, agent, conversation, response, standard_toolbelt, enabled_mcp_servers, stress_level, model_name)
+            elif tool_mode == 'xml':
+                # HACK: support buggy output that happens often in glm-4.5.
+                if '<toolname=' in response['content']:
+                    response['content'] = response['content'].replace('<toolname=', '<tool name=')
+                
+                if thoughts <= agent['max_thoughts'] and response.get('content') and '<tool name=' in response['content']:
+                    has_tools = True
+                    stress_level = self.handle_xml_tool_use(ctx, agent, conversation, response['content'], standard_toolbelt, enabled_mcp_servers, stress_level, model_name)
+
+            if not has_tools:
                 # Allow only one tool per thought.
                 break
 
@@ -1176,7 +1343,102 @@ class AgentRun(Component):
         return f"ERROR: Placeholder framework could not execute tool '{tool_name}' on server '{server_name}'"
 
 
-    def handle_tool_use(self, ctx, agent, conversation, content, standard_toolbelt, enabled_mcp_servers, stress_level, model_name):
+    def handle_openai_tool_calls(self, ctx, agent, conversation, response, standard_toolbelt, enabled_mcp_servers, stress_level, model_name):
+        """Handles OpenAI function calling format tool calls."""
+        self.last_response.value = response['content'] if response.get('content') else ""
+        
+        # Remove the assistant message with tool calls and replace with individual tool results
+        conversation.pop()  # Remove the response with tool_calls
+        
+        for tool_call in response['tool_calls']:
+            function_name = tool_call['function']['name'] 
+            function_args = tool_call['function']['arguments']
+            tool_call_id = tool_call['id']
+            
+            # Execute the tool
+            tool_result = None
+            error_message = None
+            
+            try:
+                # Parse function arguments
+                if isinstance(function_args, str):
+                    import json
+                    args_dict = json.loads(function_args)
+                else:
+                    args_dict = function_args
+                    
+                # Handle memory tools specially for OpenAI format
+                if function_name == 'lookup_memory':
+                    memory = agent.get('agent_memory')
+                    if memory:
+                        query = args_dict.get('query', '')
+                        tool_result = str(memory.query(query, 3))
+                    else:
+                        error_message = "Memory component not available for lookup_memory."
+                        
+                elif function_name == 'create_memory':
+                    memory = agent.get('agent_memory')
+                    if memory:
+                        summary = args_dict.get('summary', '')
+                        data = args_dict.get('data', {})
+                        memory.add('', summary, data)
+                        tool_result = f"Memory {summary} stored."
+                    else:
+                        error_message = "Memory component not available for create_memory."
+                        
+                # Handle standard tools
+                elif function_name in standard_toolbelt:
+                    tool_callable = standard_toolbelt[function_name]
+                    # For OpenAI format, convert args back to string or JSON for compatibility
+                    args_str = args_dict.get('input', json.dumps(args_dict) if args_dict else '')
+                    tool_result = tool_callable(args_str)
+                    
+                # Handle MCP tools
+                else:
+                    server_name = self.query_core_system_for_mcp_tool_server(function_name)
+                    if server_name and server_name in enabled_mcp_servers:
+                        # Convert args to string format expected by MCP
+                        args_str = args_dict.get('input', json.dumps(args_dict) if args_dict else '')
+                        tool_result = self.framework_use_mcp_tool(server_name, function_name, args_str)
+                    elif server_name:
+                        error_message = f"Tool '{function_name}' found on MCP server '{server_name}', but this server is not enabled for this agent run."
+                    else:
+                        error_message = f"Tool '{function_name}' not found in standard tools or any known MCP server."
+                        
+            except Exception as e:
+                error_message = f"Error executing tool '{function_name}': {e}"
+                traceback.print_exc()
+                
+            # Add tool call message to conversation  
+            conversation.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [tool_call]
+            })
+            
+            # Add tool result message
+            if error_message:
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": f"ERROR: {error_message}"
+                })
+                stress_level = min(stress_level + 0.1, 1.5)
+            else:
+                conversation.append({
+                    "role": "tool", 
+                    "tool_call_id": tool_call_id,
+                    "content": str(tool_result) if tool_result is not None else "Tool executed successfully."
+                })
+                
+            # Give on_thought a chance to see the result
+            self.out_conversation.value = conversation
+            if hasattr(self, 'on_thought') and self.on_thought:
+                SubGraphExecutor(self.on_thought).do(ctx)
+                
+        return stress_level
+
+    def handle_xml_tool_use(self, ctx, agent, conversation, content, standard_toolbelt, enabled_mcp_servers, stress_level, model_name):
         """Handles tool calls in XML format, dispatching to standard tools or enabled MCP servers."""
         self.last_response.value = conversation[-1]['content'] # Save pre-tool-call response
         
