@@ -81,8 +81,86 @@ def encode_prompt(model_id: str, conversation: list):
                     'role': message['role'],
                     'content': new_contents
                 })
-                
+
     return ret_messages
+
+
+def parse_models(spec, default=None):
+    """Parse a comma-separated model spec into an ordered list.
+
+    ``"a, b ,c"`` -> ``["a", "b", "c"]``; whitespace stripped, empties dropped, a
+    single model returned unchanged. Falls back to ``default`` (parsed the same way)
+    when ``spec`` is None/blank. Kept byte-identical to
+    xai_utils/model_fallback.py (this submodule cannot import from the parent repo).
+    """
+    items = []
+    if spec is not None:
+        items = [m.strip() for m in str(spec).split(",") if m.strip()]
+    if not items and default is not None:
+        items = [m.strip() for m in str(default).split(",") if m.strip()]
+    return items
+
+
+def invoke_with_fallback(invoke_fn, models, *, label="bedrock", logger=print):
+    """Call ``invoke_fn(model)`` per model in order; return the first success.
+
+    On any exception, log which model failed and fall back to the next; if all fail,
+    raise ``RuntimeError`` listing every attempt. Empty ``models`` -> ``ValueError``.
+    """
+    if not models:
+        raise ValueError(f"No {label} model specified.")
+    errors = []
+    for model in models:
+        try:
+            return invoke_fn(model)
+        except Exception as e:  # fall back on *any* failure, by design
+            errors.append((model, repr(e)))
+            logger(f"[{label}] model '{model}' failed: {e}; falling back to next model...")
+    raise RuntimeError(f"[{label}] all models failed: {errors}")
+
+
+def run_bedrock_with_fallback(ctx, model_name, conversation):
+    """Invoke a Claude model on Bedrock, trying each comma-separated id in turn.
+
+    ``model_name`` may be a single id or a comma-separated list; the first id that
+    returns a usable response wins, otherwise the next is tried. Build + invoke +
+    parse happen per-candidate so a bad response also triggers fallback.
+    """
+    bedrock_client = ctx.get('bedrock_client')
+    if bedrock_client is None:
+        raise Exception("Bedrock client has not been authorized")
+
+    if conversation[0]['role'] == 'system':
+        system = conversation[0]['content']
+    else:
+        system = None
+
+    models = parse_models(model_name)
+
+    def _invoke(model):
+        # deepcopy the slice: encode_prompt rewrites message roles in place, so a
+        # failed attempt must not mutate the conversation seen by the next candidate.
+        messages = encode_prompt(model, copy.deepcopy(conversation[1:]))
+        body = json.dumps({
+            "system": system,
+            "messages": messages,
+            "max_tokens": 8192,
+            "anthropic_version": "bedrock-2023-05-31"
+        })
+        response = bedrock_client.invoke_model(
+            body=body,
+            modelId=model,
+            accept="application/json",
+            contentType="application/json"
+        )
+        response_body = json.loads(response.get('body').read())
+        content = response_body.get('content')[0]
+        if content['type'] == 'text':
+            return {"role": "assistant", "content": content['text']}
+        print(content)
+        raise Exception('Unknown content type returned from model.')
+
+    return invoke_with_fallback(_invoke, models, label="bedrock-agent")
 
 
 class Memory(abc.ABC):
@@ -482,47 +560,7 @@ class AgentRun(Component):
         self.last_response.value = conversation[-1]['content']
 
     def run_bedrock(self, ctx, model_name, conversation, stress_level):
-        print(conversation)
-        print("calling anthropic...")
-        
-        bedrock_client = ctx.get('bedrock_client')
-        if bedrock_client is None:
-            raise Exception("Bedrock client has not been authorized")
-
-        if conversation[0]['role'] == 'system':
-            system = conversation[0]['content']
-        else:
-            system = None
-
-        messages = encode_prompt(model_name, conversation[1:])
-
-        body_data = {
-            "system": system,
-            "messages": messages,
-            "max_tokens": 8192,
-            "anthropic_version": "bedrock-2023-05-31"
-        }
-
-        body = json.dumps(body_data)
-        response = bedrock_client.invoke_model(
-            body=body,
-            modelId=model_name,
-            accept="application/json",
-            contentType="application/json"
-        )
-
-        response_body = json.loads(response.get('body').read())
-        content = response_body.get('content')[0]
-        if content['type'] == 'text':
-            text = content['text']
-        else:
-            print(content)
-            raise Exception('Unknown content type returned from model.')
-        response = { "role": "assistant", "content": text }
-
-        print("got response:")
-        print(response)
-        return response
+        return run_bedrock_with_fallback(ctx, model_name, conversation)
     
     def run_vertexai(self, ctx, model_name, conversation, stress_level):
         inputs = conversation_to_vertexai(conversation)
@@ -881,47 +919,7 @@ class AgentLearn(Component):
         self.last_response.value = conversation[-1]['content']
 
     def run_bedrock(self, ctx, model_name, conversation, stress_level):
-        print(conversation)
-        print("calling anthropic...")
-        
-        bedrock_client = ctx.get('bedrock_client')
-        if bedrock_client is None:
-            raise Exception("Bedrock client has not been authorized")
-
-        if conversation[0]['role'] == 'system':
-            system = conversation[0]['content']
-        else:
-            system = None
-
-        messages = encode_prompt(model_name, conversation[1:])
-
-        body_data = {
-            "system": system,
-            "messages": messages,
-            "max_tokens": 8192,
-            "anthropic_version": "bedrock-2023-05-31"
-        }
-
-        body = json.dumps(body_data)
-        response = bedrock_client.invoke_model(
-            body=body,
-            modelId=model_name,
-            accept="application/json",
-            contentType="application/json"
-        )
-
-        response_body = json.loads(response.get('body').read())
-        content = response_body.get('content')[0]
-        if content['type'] == 'text':
-            text = content['text']
-        else:
-            print(content)
-            raise Exception('Unknown content type returned from model.')
-        response = { "role": "assistant", "content": text }
-
-        print("got response:")
-        print(response)
-        return response
+        return run_bedrock_with_fallback(ctx, model_name, conversation)
     
     def run_vertexai(self, ctx, model_name, conversation, stress_level):
         inputs = conversation_to_vertexai(conversation)
