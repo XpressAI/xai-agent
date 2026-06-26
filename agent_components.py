@@ -36,7 +36,7 @@ def random_string(length):
 def encode_prompt(model_id: str, conversation: list):
     ret_messages = []
 
-    if model_id.startswith('anthropic.claude-3') or model_id.startswith('apac.anthropic.claude-3'):
+    if 'anthropic.claude' in model_id:
         for message in conversation:
             if message['role'] == 'system':
                 message['role'] = 'user'
